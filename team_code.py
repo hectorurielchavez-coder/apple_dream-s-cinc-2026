@@ -94,12 +94,13 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
             if verbose:
                 pbar.set_postfix({"patient": patient_id})
 
-            # ── Demographics ──────────────────────────────────────────────────
-            patient_data      = load_demographics(patient_data_file,
-                                                  patient_id, session_id)
-            demographic_feats = extract_demographic_features(patient_data)
+            # ── Label (necesita patient_data de load_demographics) ─────────────
+            patient_data = load_demographics(patient_data_file, patient_id, session_id)
+            label = load_label(patient_data)
+            if label not in (0, 1):
+                continue
 
-            # ── CAISR algorithmic annotations (required for our pipeline) ─────
+            # ── CAISR annotations ─────────────────────────────────────────────
             algo_file = os.path.join(
                 data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
                 site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf"
@@ -110,37 +111,12 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
                 continue
 
             algo_data, _ = load_signal_data(algo_file)
+            sleep_feats  = extract_sleep_features(algo_data)   # devuelve dict
+            del algo_data
 
-            # ── Sleep features (our validated pipeline) ───────────────────────
-            sleep_feats = extract_sleep_features(algo_data)
-
-            # ── Physiological signal features (optional; fallback to zeros) ───
-            phys_file = os.path.join(
-                data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER,
-                site_id, f"{patient_id}_ses-{session_id}.edf"
-            )
-            if os.path.exists(phys_file):
-                phys_data, phys_fs = load_signal_data(phys_file)
-                phys_feats = extract_physiological_features(
-                    phys_data, phys_fs, csv_path=csv_path)
-            else:
-                phys_feats = np.zeros(49)
-
-            # ── Label ─────────────────────────────────────────────────────────
-            label = load_label(patient_data)
-            if label not in (0, 1):
-                continue
-
-            features_list.append(
-                np.hstack([demographic_feats, sleep_feats, phys_feats])
-            )
+            features_list.append(sleep_feats)
             labels_list.append(label)
             groups_list.append(site_id)
-
-            # Free large arrays
-            del algo_data
-            if 'phys_data' in locals():
-                del phys_data
 
         except Exception as e:
             tqdm.write(f"  !!! Error on record {patient_id}: {e}")
@@ -151,9 +127,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     if len(features_list) == 0:
         raise ValueError("No valid records were processed.")
 
-    X      = np.asarray(features_list, dtype=np.float32)
-    y      = np.asarray(labels_list,   dtype=int)
-    groups = np.asarray(groups_list)
+    # DataFrame con columnas nombradas + __site__ para SiteNormalizer
+    X              = pd.DataFrame(features_list)
+    X["__site__"]  = groups_list
+    y              = np.asarray(labels_list, dtype=int)
 
     if verbose:
         print(f'Training on {len(y)} records  CI=True:{y.sum()}  CI=False:{(1-y).sum()}')
@@ -185,11 +162,6 @@ def run_model(model, record, data_folder, verbose):
     site_id    = record[HEADERS['site_id']]
     session_id = record[HEADERS['session_id']]
 
-    # ── Demographics ──────────────────────────────────────────────────────────
-    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-    patient_data      = load_demographics(patient_data_file, patient_id, session_id)
-    demographic_feats = extract_demographic_features(patient_data)
-
     # ── CAISR annotations ─────────────────────────────────────────────────────
     algo_file = os.path.join(
         data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
@@ -197,25 +169,19 @@ def run_model(model, record, data_folder, verbose):
     )
     if os.path.exists(algo_file):
         algo_data, _ = load_signal_data(algo_file)
-        sleep_feats  = extract_sleep_features(algo_data)
+        sleep_feats  = extract_sleep_features(algo_data)   # devuelve dict
     else:
-        sleep_feats = np.zeros(_SLEEP_FEAT_DIM)
+        _KEYS = ["arousal_index", "PLM_index", "pct_REM_first_half",
+                 "hypno_entropy", "frag_N3toW", "WASO_min",
+                 "cycle_rem_mean", "bout_n_N3"]
+        sleep_feats = {k: 0.0 for k in _KEYS}
 
-    # ── Physiological signal ──────────────────────────────────────────────────
-    phys_file = os.path.join(
-        data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER,
-        site_id, f"{patient_id}_ses-{session_id}.edf"
-    )
-    if os.path.exists(phys_file):
-        phys_data, phys_fs = load_signal_data(phys_file)
-        phys_feats = extract_physiological_features(phys_data, phys_fs)
-    else:
-        phys_feats = np.zeros(49)
+    # DataFrame con __site__ para que SiteNormalizer aplique correctamente
+    features_df             = pd.DataFrame([sleep_feats])
+    features_df["__site__"] = site_id
 
-    features = np.hstack([demographic_feats, sleep_feats, phys_feats]).reshape(1, -1)
-
-    binary_output      = int(clf.predict(features)[0])
-    probability_output = float(clf.predict_proba(features)[0][1])
+    binary_output      = int(clf.predict(features_df)[0])
+    probability_output = float(clf.predict_proba(features_df)[0][1])
 
     return binary_output, probability_output
 
@@ -306,38 +272,9 @@ def _make_elasticnet(C=0.1, l1_ratio=0.5):
 #
 ################################################################################
 
-_SLEEP_FEATURE_NAMES = [
-    # Architecture (14)
-    "TIB_min", "TST_min", "SE_pct",
-    "pct_N3", "pct_N2", "pct_N1", "pct_REM", "pct_Wake",
-    "SOL_min", "WASO_min", "REM_latency_min",
-    "arousal_index", "AHI", "PLM_index",
-    # Additional event indices (4)
-    "AI_obst", "AI_cent", "AI_hyp", "RERA_index",
-    # Bout stats (10: 5 stages × mean + n)
-    "bout_mean_N3", "bout_n_N3",
-    "bout_mean_N2", "bout_n_N2",
-    "bout_mean_N1", "bout_n_N1",
-    "bout_mean_REM", "bout_n_REM",
-    "bout_mean_Wake", "bout_n_Wake",
-    # Complexity (4)
-    "hypno_entropy", "hypno_lz_complexity",
-    "transition_entropy_cross", "stage_entropy",
-    # REM fragmentation (2)
-    "rem_fragmentation", "rem_bout_mean_min",
-    # N3 fragmentation (3)
-    "n3_bouts_short", "n3_bouts_long", "n3_fragmentation_ratio",
-    # Temporal distribution (2)
-    "n3_front_loading", "rem_back_loading",
-    # Prob channels (3)
-    "prob_w_mean", "prob_n3_mean", "prob_arous_mean",
-]
-
-
-
 # Sentinel: number of features returned by extract_sleep_features()
 # (used as fallback dimension in run_model when the CAISR file is absent)
-_SLEEP_FEAT_DIM = len(_SLEEP_FEATURE_NAMES)   # updated automatically when the function grows
+_SLEEP_FEAT_DIM = 46   # updated automatically when the function grows
 
 
 # ── Stage cleaning (temporal_features.py FIX 4) ──────────────────────────────
@@ -677,46 +614,135 @@ def _compute_temporal_features(stages):
 
 # Ordered feature names — must match the order features are assembled below.
 # Update _SLEEP_FEAT_DIM if you add / remove features here.
+_SLEEP_FEATURE_NAMES = [
+    # Architecture (14)
+    "TIB_min", "TST_min", "SE_pct",
+    "pct_N3", "pct_N2", "pct_N1", "pct_REM", "pct_Wake",
+    "SOL_min", "WASO_min", "REM_latency_min",
+    "arousal_index", "AHI", "PLM_index",
+    # Additional event indices (4)
+    "AI_obst", "AI_cent", "AI_hyp", "RERA_index",
+    # Bout stats (10: 5 stages × mean + n)
+    "bout_mean_N3", "bout_n_N3",
+    "bout_mean_N2", "bout_n_N2",
+    "bout_mean_N1", "bout_n_N1",
+    "bout_mean_REM", "bout_n_REM",
+    "bout_mean_Wake", "bout_n_Wake",
+    # Complexity (4)
+    "hypno_entropy", "hypno_lz_complexity",
+    "transition_entropy_cross", "stage_entropy",
+    # REM fragmentation (2)
+    "rem_fragmentation", "rem_bout_mean_min",
+    # N3 fragmentation (3)
+    "n3_bouts_short", "n3_bouts_long", "n3_fragmentation_ratio",
+    # Temporal distribution (2)
+    "n3_front_loading", "rem_back_loading",
+    # Prob channels (3)
+    "prob_w_mean", "prob_n3_mean", "prob_arous_mean",
+]
 
 _SLEEP_FEAT_DIM = len(_SLEEP_FEATURE_NAMES)   # = 42 — kept in sync
 
 
+
+# ── Top-8 feature extractor (refine.py validated subset) ────────────────────
+
+_TOP8_KEYS = [
+    "arousal_index", "PLM_index", "pct_REM_first_half",
+    "hypno_entropy", "frag_N3toW", "WASO_min",
+    "cycle_rem_mean", "bout_n_N3",
+]
+
+def _get_top_8_features(stages, algo_data):
+    """Extrae exactamente las 8 features del modelo refinado."""
+    feat = {}
+
+    # WASO, arousal_index, PLM_index
+    arch = _compute_architecture_features(stages, algo_data)
+    feat["WASO_min"]      = arch["WASO_min"]
+    feat["arousal_index"] = arch["arousal_index"]
+    feat["PLM_index"]     = arch["PLM_index"]
+
+    # hypno_entropy, bout_n_N3
+    temp = _compute_temporal_features(stages)
+    feat["hypno_entropy"] = temp["hypno_entropy"]
+    feat["bout_n_N3"]     = temp["bout_n_N3"]
+
+    # pct_REM_first_half
+    valid   = stages[np.isin(stages, list(STAGE_NAMES.keys()))]
+    first_h = valid[:len(valid) // 2]
+    feat["pct_REM_first_half"] = (
+        float(np.sum(first_h == 4) / len(first_h) * 100) if len(first_h) else 0.0
+    )
+
+    # frag_N3toW (transición directa N3→W)
+    trans = Counter(zip(valid[:-1], valid[1:]))
+    feat["frag_N3toW"] = float(trans.get((1, 5), 0))
+
+    # cycle_rem_mean (Feinberg & Floyd, min_nrem=6, min_rem=3)
+    s = np.where(np.isin(stages, [1, 2, 3]), 1,
+        np.where(stages == 4, 2, 3))
+    cycles, i, n = [], 0, len(s)
+    while i < n:
+        if s[i] != 1:
+            i += 1
+            continue
+        nrem_count, j = 0, i
+        while j < n:
+            if s[j] == 1:
+                nrem_count += 1
+                j += 1
+            elif s[j] == 3:
+                k = j
+                while k < n and s[k] == 3:
+                    k += 1
+                if (k - j) < 5 and k < n and s[k] == 1:
+                    j = k
+                else:
+                    break
+            else:
+                break
+        if nrem_count < 6:
+            i = j + 1
+            continue
+        while j < n and s[j] == 3:
+            j += 1
+        if j >= n or s[j] != 2:
+            i = j + 1
+            continue
+        rem_count = 0
+        while j < n and s[j] == 2:
+            rem_count += 1
+            j += 1
+        if rem_count < 3:
+            i = j + 1
+            continue
+        cycles.append(rem_count)
+        i = j
+    feat["cycle_rem_mean"] = (
+        float(np.mean([c * EPOCH_SEC / 60 for c in cycles])) if cycles else 0.0
+    )
+
+    return feat
+
 def extract_sleep_features(algo_data):
     """
-    Master function: reads algo_data dict (from load_signal_data on a CAISR EDF)
-    and returns a 1-D float32 feature vector of length _SLEEP_FEAT_DIM.
+    Devuelve un dict con exactamente las 8 features del modelo refinado.
+    El SiteNormalizer espera un DataFrame con columnas nombradas — este dict
+    se convierte a DataFrame en train_model y run_model antes de fit/predict.
     """
     stages = _extract_stages_from_caisr(algo_data)
 
     if len(stages) < 10:
-        return np.zeros(_SLEEP_FEAT_DIM, dtype=np.float32)
+        return {k: 0.0 for k in _TOP8_KEYS}
 
-    arch_feat = _compute_architecture_features(stages, algo_data)
-    temp_feat = _compute_temporal_features(stages)
-
-    # CAISR probability channels
-    prob_w     = float(np.mean(algo_data.get("caisr_prob_w",    np.array([0]))))
-    prob_n3    = float(np.mean(algo_data.get("caisr_prob_n3",   np.array([0]))))
-    prob_arous = float(np.mean(algo_data.get("caisr_prob_arous",np.array([0]))))
-    prob_w     = prob_w     if prob_w     <= 1.0 else 0.0
-    prob_n3    = prob_n3    if prob_n3    <= 1.0 else 0.0
-    prob_arous = prob_arous if prob_arous <= 1.0 else 0.0
-
-    prob_feat = {
-        "prob_w_mean":     prob_w,
-        "prob_n3_mean":    prob_n3,
-        "prob_arous_mean": prob_arous,
-    }
-
-    combined = {**arch_feat, **temp_feat, **prob_feat}
-
-    vec = np.array(
-        [combined.get(name, 0.0) for name in _SLEEP_FEATURE_NAMES],
-        dtype=np.float32
-    )
-    # Replace any NaN / inf with 0 (safe fallback)
-    vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
-    return vec
+    raw = _get_top_8_features(stages, algo_data)
+    # Garantizar el orden de columnas y limpiar NaN/inf
+    result = {}
+    for k in _TOP8_KEYS:
+        v = raw.get(k, 0.0)
+        result[k] = float(v) if np.isfinite(v) else 0.0
+    return result
 
 
 ################################################################################
