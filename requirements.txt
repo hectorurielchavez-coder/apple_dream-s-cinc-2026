@@ -1,7 +1,22 @@
-edfio==0.4.10
-joblib==1.4.2
-numpy==2.0.2
-pandas==2.2.2
-scikit-learn==1.6.0
-scipy==1.13.1
-tqdm==4.67.1
+# ── Core scientific stack ──────────────────────────────────────────────────────
+numpy==1.23.5
+scipy==1.9.3
+pandas==1.5.3
+ 
+# ── Machine learning ───────────────────────────────────────────────────────────
+scikit-learn==1.2.2
+joblib==1.2.0
+ 
+# ── EDF reading ────────────────────────────────────────────────────────────────
+# helper_code.py uses edfio; build_features.py / temporal_features.py use MNE
+edfio==0.4.2
+mne==1.3.1
+ 
+# ── Statistical modelling (arousal_ahi_analysis.py) ───────────────────────────
+statsmodels==0.13.5
+ 
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib==3.6.3
+ 
+# ── Progress bar ──────────────────────────────────────────────────────────────
+tqdm==4.65.0
