@@ -246,7 +246,11 @@ class _SiteNormalizer(BaseEstimator, TransformerMixin):
                     m    = X["__site__"] == site
                     sd   = X.loc[m, feat_cols]
                     sm   = sd.mean()
-                    ss   = sd.std().replace(0, 1)
+                    ss   = sd.std()
+                    # n=1 → std es NaN; cualquier std=0 también es inválido.
+                    # En ambos casos caemos al std global calculado en fit().
+                    bad  = ss.isna() | (ss == 0)
+                    ss[bad] = self.global_std_[ss.index[bad]]
                     result.loc[m] = ((sd - sm) / ss).values
         else:
             result = (X[feat_cols] - self.global_mean_) / self.global_std_
