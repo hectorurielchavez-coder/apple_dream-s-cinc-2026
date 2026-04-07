@@ -26,6 +26,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import StratifiedGroupKFold, cross_validate
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.base import BaseEstimator, TransformerMixin
 from tqdm import tqdm
 
@@ -61,13 +62,14 @@ RESP_MIN_DURATION_S = 10       # AASM minimum event duration
 #
 ################################################################################
 
+
 def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     """Train the ElasticNet model on the full training set."""
 
     if verbose:
         print('Finding the Challenge data...')
 
-    patient_data_file    = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+    patient_data_file     = os.path.join(data_folder, DEMOGRAPHICS_FILE)
     patient_metadata_list = find_patients(patient_data_file)
     num_records           = len(patient_metadata_list)
 
@@ -79,7 +81,6 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
     features_list = []
     labels_list   = []
-    groups_list   = []   # SiteID — used for stratified CV during training
 
     pbar = tqdm(range(num_records), desc="Extracting", unit="record",
                 disable=not verbose)
@@ -94,7 +95,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
             if verbose:
                 pbar.set_postfix({"patient": patient_id})
 
-            # ── Label (necesita patient_data de load_demographics) ─────────────
+            # ── Label ─────────────────────────────────────────────────────────
             patient_data = load_demographics(patient_data_file, patient_id, session_id)
             label = load_label(patient_data)
             if label not in (0, 1):
@@ -111,12 +112,11 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
                 continue
 
             algo_data, _ = load_signal_data(algo_file)
-            sleep_feats  = extract_sleep_features(algo_data)   # devuelve dict
+            sleep_feats  = extract_sleep_features(algo_data)
             del algo_data
 
             features_list.append(sleep_feats)
             labels_list.append(label)
-            groups_list.append(site_id)
 
         except Exception as e:
             tqdm.write(f"  !!! Error on record {patient_id}: {e}")
@@ -127,20 +127,69 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     if len(features_list) == 0:
         raise ValueError("No valid records were processed.")
 
-    # DataFrame con columnas nombradas + __site__ para SiteNormalizer
-    X              = pd.DataFrame(features_list)
-    X["__site__"]  = groups_list
-    y              = np.asarray(labels_list, dtype=int)
+    X = pd.DataFrame(features_list)
+    y = np.asarray(labels_list, dtype=int)
 
     if verbose:
         print(f'Training on {len(y)} records  CI=True:{y.sum()}  CI=False:{(1-y).sum()}')
 
-    # ── ElasticNet (same architecture as refine.py) ───────────────────────────
-    model_pipeline = _make_elasticnet(C=0.01, l1_ratio=0.0)
+    # ── ElasticNet (Hiperparámetros refinados: Ridge puro) ───────────────────
+    model_pipeline = _make_elasticnet(C=0.05, l1_ratio=0.0)
     model_pipeline.fit(X, y)
 
-    # Save
+    # ── Calibración de prevalencia (Prior-Shift al 10%) ──────────────────────
+    TARGET_PREVALENCE = 0.10
+    train_prev  = float(y.mean())
+    log_odds_shift = (
+        np.log(TARGET_PREVALENCE / (1.0 - TARGET_PREVALENCE))
+        - np.log(train_prev / (1.0 - train_prev))
+    )
+    
+    if verbose:
+        print(f'Training prevalence: {train_prev:.3f} -> '
+              f'log-odds shift: {log_odds_shift:.3f}')
+
+    # ── Búsqueda del Umbral Óptimo (Simulando 10% prevalencia) ───────────────
+    from sklearn.metrics import precision_recall_curve
+
+    idx_sanos = np.where(y == 0)[0]
+    idx_enfermos = np.where(y == 1)[0]
+    target_enfermos = len(idx_sanos) // 9
+    
+    np.random.seed(42)
+    target_enfermos = min(target_enfermos, len(idx_enfermos))
+    
+    if target_enfermos > 0:
+        idx_enfermos_red = np.random.choice(idx_enfermos, size=target_enfermos, replace=False)
+        idx_sim = np.concatenate([idx_sanos, idx_enfermos_red])
+        
+        # Predicción con blindaje contra valores extremos en logaritmos
+        raw_probs_sim = model_pipeline.predict_proba(X.iloc[idx_sim])[:, 1]
+        raw_probs_sim = np.clip(raw_probs_sim, 1e-10, 1.0 - 1e-10)
+        
+        log_odds_sim = np.log(raw_probs_sim / (1.0 - raw_probs_sim)) + log_odds_shift
+        probs_cal_sim = 1.0 / (1.0 + np.exp(-log_odds_sim))
+
+        # Optimización del F1-Score
+        precision, recall, thresholds = precision_recall_curve(y[idx_sim], probs_cal_sim)
+        num = 2 * recall * precision
+        den = recall + precision
+        f1s = np.divide(num, den, out=np.zeros_like(num), where=(den!=0))
+        
+        idx_optimo = np.argmax(f1s)
+        umbral_optimo = thresholds[idx_optimo] if idx_optimo < len(thresholds) else 0.5
+    else:
+        umbral_optimo = 0.5 
+        
+    if verbose:
+        print(f'Optimal threshold for F1: {umbral_optimo:.3f}')
+
+    # ── Persistencia del umbral inyectado y guardado oficial ────────────────
+    model_pipeline.threshold_ = umbral_optimo
+
     os.makedirs(model_folder, exist_ok=True)
+    # Solo pasamos dos argumentos: la carpeta y el objeto pipeline (que ya lleva el umbral e incluso puedes pegarle el shift)
+    model_pipeline.log_odds_shift_ = log_odds_shift # Inyectamos el shift también
     save_model(model_folder, model_pipeline)
 
     if verbose:
@@ -156,7 +205,12 @@ def load_model(model_folder, verbose):
 def run_model(model, record, data_folder, verbose):
     """Run the trained model on a single record and return (binary, probability)."""
 
+    # Extraemos el objeto pipeline del diccionario cargado
     clf = model['model']
+    
+    # Recuperamos los atributos inyectados con getattr por seguridad
+    log_odds_shift = getattr(clf, 'log_odds_shift_', 0.0)
+    threshold      = getattr(clf, 'threshold_', 0.5)
 
     patient_id = record[HEADERS['bids_folder']]
     site_id    = record[HEADERS['site_id']]
@@ -167,21 +221,30 @@ def run_model(model, record, data_folder, verbose):
         data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
         site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf"
     )
+    
+    # Bloque de seguridad try-except para archivos CAISR
+    sleep_feats = {k: 0.0 for k in _TOP12_KEYS}
     if os.path.exists(algo_file):
-        algo_data, _ = load_signal_data(algo_file)
-        sleep_feats  = extract_sleep_features(algo_data)   # devuelve dict
+        try:
+            algo_data, _ = load_signal_data(algo_file)
+            sleep_feats  = extract_sleep_features(algo_data)
+        except Exception as e:
+            if verbose:
+                print(f"Error loading CAISR for {patient_id}: {e}")
+
+    features_df = pd.DataFrame([sleep_feats])
+
+    # Predicción y aplicación de calibración
+    raw_prob = float(clf.predict_proba(features_df)[0][1])
+    raw_prob_safe = np.clip(raw_prob, 1e-10, 1.0 - 1e-10)
+
+    if log_odds_shift != 0.0:
+        log_odds           = np.log(raw_prob_safe / (1.0 - raw_prob_safe)) + log_odds_shift
+        probability_output = float(1.0 / (1.0 + np.exp(-log_odds)))
     else:
-        _KEYS = ["arousal_index", "PLM_index", "pct_REM_first_half",
-                 "hypno_entropy", "frag_N3toW", "WASO_min",
-                 "cycle_rem_mean", "bout_n_N3"]
-        sleep_feats = {k: 0.0 for k in _KEYS}
+        probability_output = raw_prob
 
-    # DataFrame con __site__ para que SiteNormalizer aplique correctamente
-    features_df             = pd.DataFrame([sleep_feats])
-    features_df["__site__"] = site_id
-
-    binary_output      = int(clf.predict(features_df)[0])
-    probability_output = float(clf.predict_proba(features_df)[0][1])
+    binary_output = int(probability_output >= threshold)
 
     return binary_output, probability_output
 
@@ -193,7 +256,7 @@ def run_model(model, record, data_folder, verbose):
 ################################################################################
 
 def save_model(model_folder, model):
-    d        = {'model': model}
+    d = {'model': model}
     filename = os.path.join(model_folder, 'model.sav')
     joblib.dump(d, filename, protocol=0)
 
@@ -204,70 +267,18 @@ def save_model(model_folder, model):
 #
 ################################################################################
 
-class _SiteNormalizer(BaseEstimator, TransformerMixin):
-    """
-    Per-site Z-score normalisation.  Falls back to global stats for unseen sites.
-    The __site__ column is consumed here and NOT passed to the classifier.
-    """
 
-    def fit(self, X, y=None):
-        X = pd.DataFrame(X).copy()
-        feat_cols = [c for c in X.columns if c != "__site__"]
-        self.global_median_ = X[feat_cols].median()
-        self.global_mean_   = X[feat_cols].mean()
-        self.global_std_    = X[feat_cols].std().replace(0, 1)
-        self.site_stats_    = {}
-        if "__site__" in X.columns:
-            for site, grp in X.groupby("__site__"):
-                filled = grp[feat_cols].fillna(self.global_median_)
-                self.site_stats_[site] = {
-                    "mean": filled.mean(),
-                    "std":  filled.std().replace(0, 1),
-                }
-        return self
-
-    def transform(self, X, y=None):
-        X         = pd.DataFrame(X).copy()
-        feat_cols = [c for c in X.columns if c != "__site__"]
-        for col in feat_cols:
-            X[col] = X[col].fillna(self.global_median_[col]
-                                   if col in self.global_median_ else 0.0)
-        result = X[feat_cols].astype(float).copy()
-        if self.site_stats_ and "__site__" in X.columns:
-            for site, stats in self.site_stats_.items():
-                mask = X["__site__"] == site
-                if mask.any():
-                    result.loc[mask] = (
-                        (X.loc[mask, feat_cols] - stats["mean"]) / stats["std"]
-                    ).values
-            unknown = ~X["__site__"].isin(self.site_stats_)
-            if unknown.any():
-                for site in X.loc[unknown, "__site__"].unique():
-                    m    = X["__site__"] == site
-                    sd   = X.loc[m, feat_cols]
-                    sm   = sd.mean()
-                    ss   = sd.std()
-                    # n=1 → std es NaN; cualquier std=0 también es inválido.
-                    # En ambos casos caemos al std global calculado en fit().
-                    bad  = ss.isna() | (ss == 0)
-                    ss[bad] = self.global_std_[ss.index[bad]]
-                    result.loc[m] = ((sd - sm) / ss).values
-        else:
-            result = (X[feat_cols] - self.global_mean_) / self.global_std_
-        return result.values.astype(float)
-
-
-def _make_elasticnet(C=0.1, l1_ratio=0.5):
+def _make_elasticnet(C=0.05, l1_ratio=0.0):
     return Pipeline([
-        ("norm", _SiteNormalizer()),
+        ("imp", SimpleImputer(strategy="median")),
+        ("scl", StandardScaler()),
         ("clf",  LogisticRegression(
             penalty="elasticnet", solver="saga",
             C=C, l1_ratio=l1_ratio,
-            max_iter=3000, class_weight="balanced",
-            random_state=42,
+            max_iter=3000, 
+            random_state=42, # class_weight="balanced" eliminado
         )),
     ])
-
 
 ################################################################################
 #
@@ -649,78 +660,74 @@ _SLEEP_FEAT_DIM = len(_SLEEP_FEATURE_NAMES)   # = 42 — kept in sync
 
 
 
-# ── Top-8 feature extractor (refine.py validated subset) ────────────────────
 
-_TOP8_KEYS = [
+_TOP12_KEYS = [
     "arousal_index", "PLM_index", "pct_REM_first_half",
     "hypno_entropy", "frag_N3toW", "WASO_min",
-    "cycle_rem_mean", "bout_n_N3",
+    "cycle_rem_mean", "bout_n_N3", 
+    # Nuevas añadidas por el refinamiento:
+    "rem_progression", "bout_n_REM", 
+    "n3_fragmentation_ratio", "bout_max_REM"
 ]
 
-def _get_top_8_features(stages, algo_data):
-    """Extrae exactamente las 8 features del modelo refinado."""
+def _get_top_12_features(stages, algo_data):
+    """Extrae exactamente las 12 features del modelo refinado final."""
     feat = {}
 
-    # WASO, arousal_index, PLM_index
     arch = _compute_architecture_features(stages, algo_data)
     feat["WASO_min"]      = arch["WASO_min"]
     feat["arousal_index"] = arch["arousal_index"]
     feat["PLM_index"]     = arch["PLM_index"]
 
-    # hypno_entropy, bout_n_N3
     temp = _compute_temporal_features(stages)
-    feat["hypno_entropy"] = temp["hypno_entropy"]
-    feat["bout_n_N3"]     = temp["bout_n_N3"]
+    feat["hypno_entropy"]          = temp.get("hypno_entropy", 0.0)
+    feat["bout_n_N3"]              = temp.get("bout_n_N3", 0.0)
+    feat["bout_n_REM"]             = temp.get("bout_n_REM", 0.0)
+    feat["n3_fragmentation_ratio"] = temp.get("n3_fragmentation_ratio", 0.0)
 
-    # pct_REM_first_half
+    # bout_max_REM
+    bouts = _get_bouts(stages)
+    rem_durs = [n * EPOCH_SEC / 60 for s, n in bouts if s == 4]
+    feat["bout_max_REM"] = float(np.max(rem_durs)) if rem_durs else 0.0
+
     valid   = stages[np.isin(stages, list(STAGE_NAMES.keys()))]
-    first_h = valid[:len(valid) // 2]
+    half_idx = len(valid) // 2
+    first_h = valid[:half_idx]
+    second_h = valid[half_idx:]
+
     feat["pct_REM_first_half"] = (
         float(np.sum(first_h == 4) / len(first_h) * 100) if len(first_h) else 0.0
     )
+    pct_rem_second_half = (
+        float(np.sum(second_h == 4) / len(second_h) * 100) if len(second_h) else 0.0
+    )
+    # rem_progression: ratio de la segunda mitad contra la primera
+    feat["rem_progression"] = pct_rem_second_half / (feat["pct_REM_first_half"] + 1e-6)
 
-    # frag_N3toW (transición directa N3→W)
     trans = Counter(zip(valid[:-1], valid[1:]))
     feat["frag_N3toW"] = float(trans.get((1, 5), 0))
 
-    # cycle_rem_mean (Feinberg & Floyd, min_nrem=6, min_rem=3)
+    # cycle_rem_mean (igual que antes)
     s = np.where(np.isin(stages, [1, 2, 3]), 1,
         np.where(stages == 4, 2, 3))
     cycles, i, n = [], 0, len(s)
     while i < n:
-        if s[i] != 1:
-            i += 1
-            continue
+        if s[i] != 1: i += 1; continue
         nrem_count, j = 0, i
         while j < n:
-            if s[j] == 1:
-                nrem_count += 1
-                j += 1
+            if s[j] == 1: nrem_count += 1; j += 1
             elif s[j] == 3:
                 k = j
-                while k < n and s[k] == 3:
-                    k += 1
-                if (k - j) < 5 and k < n and s[k] == 1:
-                    j = k
-                else:
-                    break
-            else:
-                break
-        if nrem_count < 6:
-            i = j + 1
-            continue
-        while j < n and s[j] == 3:
-            j += 1
-        if j >= n or s[j] != 2:
-            i = j + 1
-            continue
+                while k < n and s[k] == 3: k += 1
+                if (k - j) < 5 and k < n and s[k] == 1: j = k
+                else: break
+            else: break
+        if nrem_count < 6: i = j + 1; continue
+        while j < n and s[j] == 3: j += 1
+        if j >= n or s[j] != 2: i = j + 1; continue
         rem_count = 0
-        while j < n and s[j] == 2:
-            rem_count += 1
-            j += 1
-        if rem_count < 3:
-            i = j + 1
-            continue
+        while j < n and s[j] == 2: rem_count += 1; j += 1
+        if rem_count < 3: i = j + 1; continue
         cycles.append(rem_count)
         i = j
     feat["cycle_rem_mean"] = (
@@ -730,20 +737,14 @@ def _get_top_8_features(stages, algo_data):
     return feat
 
 def extract_sleep_features(algo_data):
-    """
-    Devuelve un dict con exactamente las 8 features del modelo refinado.
-    El SiteNormalizer espera un DataFrame con columnas nombradas — este dict
-    se convierte a DataFrame en train_model y run_model antes de fit/predict.
-    """
     stages = _extract_stages_from_caisr(algo_data)
 
     if len(stages) < 10:
-        return {k: 0.0 for k in _TOP8_KEYS}
+        return {k: 0.0 for k in _TOP12_KEYS}
 
-    raw = _get_top_8_features(stages, algo_data)
-    # Garantizar el orden de columnas y limpiar NaN/inf
+    raw = _get_top_12_features(stages, algo_data)
     result = {}
-    for k in _TOP8_KEYS:
+    for k in _TOP12_KEYS:
         v = raw.get(k, 0.0)
         result[k] = float(v) if np.isfinite(v) else 0.0
     return result
