@@ -185,7 +185,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         print(f'Optimal threshold for F1: {umbral_optimo:.3f}')
 
     # ── Persistencia del umbral inyectado y guardado oficial ────────────────
-    model_pipeline.threshold_ = umbral_optimo
+    model_pipeline.threshold_ = 0.5
 
     os.makedirs(model_folder, exist_ok=True)
     # Solo pasamos dos argumentos: la carpeta y el objeto pipeline (que ya lleva el umbral e incluso puedes pegarle el shift)
