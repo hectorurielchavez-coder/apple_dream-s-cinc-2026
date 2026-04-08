@@ -166,6 +166,12 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         # Predicción con blindaje contra valores extremos en logaritmos
         raw_probs_sim = model_pipeline.predict_proba(X.iloc[idx_sim])[:, 1]
         raw_probs_sim = np.clip(raw_probs_sim, 1e-10, 1.0 - 1e-10)
+        probs_raw = model_pipeline.predict_proba(X)[:, 1]
+        probs_raw = np.clip(probs_raw, 1e-10, 1 - 1e-10)
+        log_odds_cal = np.log(probs_raw / (1 - probs_raw)) + log_odds_shift
+        probs_cal = 1.0 / (1.0 + np.exp(-log_odds_cal))
+        print(f"Media de probs calibradas: {probs_cal.mean():.3f}")
+        print(f"Positivos con umbral 0.5: {(probs_cal >= 0.5).mean():.3f}")  # debería ≈ 0.10
         
         log_odds_sim = np.log(raw_probs_sim / (1.0 - raw_probs_sim)) + log_odds_shift
         probs_cal_sim = 1.0 / (1.0 + np.exp(-log_odds_sim))
@@ -185,7 +191,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         print(f'Optimal threshold for F1: {umbral_optimo:.3f}')
 
     # ── Persistencia del umbral inyectado y guardado oficial ────────────────
-    model_pipeline.threshold_ = 0.5
+    model_pipeline.threshold_ = umbral_optimo
 
     os.makedirs(model_folder, exist_ok=True)
     # Solo pasamos dos argumentos: la carpeta y el objeto pipeline (que ya lleva el umbral e incluso puedes pegarle el shift)
